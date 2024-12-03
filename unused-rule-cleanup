@@ -1,0 +1,282 @@
+import csv
+import re
+from panos.panorama import Panorama, DeviceGroup
+from panos.policies import PreRulebase, PostRulebase, SecurityRule
+from panos.objects import Tag
+from netmiko import ConnectHandler
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from panos import errors
+import getpass  # Added import for getpass
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+PANORAMAS = {
+    "pano": "PANO_IP",
+    "pano": "PANO_IP",
+    "pano": "PANO_IP",
+    
+}
+
+# Prompt the user for credentials using getpass
+USERNAME = input("Enter username: ")
+PASSWORD = getpass.getpass("Enter password: ")
+
+# Consolidate ADMIN_NAME with USERNAME
+# ADMIN_NAME = "YOUR_ADMIN_NAME"  # Removed this line
+
+AUDIT_FILE = 'audit_log.txt'
+
+def create_tag_if_not_exists(panorama, tag_name):
+    existing_tags = Tag.refreshall(panorama)
+    for tag in existing_tags:
+        if tag.name == tag_name:
+            return
+    new_tag = Tag(name=tag_name)
+    panorama.add(new_tag)
+    new_tag.create()
+
+def fetch_rules(device_group, rule_type):
+    rulebase_class = PreRulebase if rule_type == 'pre-rulebase' else PostRulebase
+    rulebase = rulebase_class()
+    device_group.add(rulebase)
+    rules = SecurityRule.refreshall(rulebase, add=True)
+    return rules
+
+def format_date(date_str):
+    if date_str:
+        try:
+            date_obj = datetime.strptime(date_str, '%a %b %d %H:%M:%S %Y')
+            return date_obj.strftime('%d-%b-%Y, %H:%M:%S')
+        except ValueError as e:
+            print(f"Error parsing date: {date_str} - {e}")
+    return date_str
+
+def parse_date(date_str):
+    if date_str:
+        try:
+            return datetime.strptime(date_str, '%d-%b-%Y, %H:%M:%S')
+        except ValueError as e:
+            print(f"Error parsing date: {date_str} - {e}")
+    return None
+
+def get_rule_usage(device_group, rule_type, ssh):
+    try:
+        cmd = f"show rule-hit-count device-group {device_group.name} {rule_type} security rules all"
+        response_text = ssh.send_command(cmd, expect_string=r'[>#]')
+        print(f"Response text for {device_group.name} {rule_type}:")
+        print(response_text)
+
+        rule_usage_data = {}
+        lines = response_text.strip().split("\n")
+        current_rule_name = None
+        current_rule_status = "-"
+        current_rule_created = None
+
+        for line in lines:
+            if 'Rule Name' in line or '----' in line or 'Total Hit Count:' in line:
+                continue
+            if re.match(r'^\w', line) and "Unused" not in line and "Used" not in line and "Partially Used" not in line:
+                if current_rule_name:
+                    rule_usage_data[current_rule_name] = {
+                        'status': current_rule_status,
+                        'created': format_date(current_rule_created)
+                    }
+                current_rule_name = line.strip()
+                current_rule_status = "-"
+                current_rule_created = None
+            else:
+                match = re.search(r'(Used|Unused|Partially Used|-)', line)
+                created_match = re.search(r'([A-Za-z]+\s+[A-Za-z]+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})', line)
+                if created_match:
+                    current_rule_created = created_match.group(1)
+                if match:
+                    status = match.group(1)
+                    if "Used" in [status, current_rule_status]:
+                        current_rule_status = "Used"
+                    elif "Partially Used" in [status, current_rule_status] and current_rule_status != "Used":
+                        current_rule_status = "Partially Used"
+                    elif current_rule_status == "-" and status != "Used":
+                        current_rule_status = status
+
+        if current_rule_name and current_rule_status != "-":
+            rule_usage_data[current_rule_name] = {
+                'status': current_rule_status,
+                'created': format_date(current_rule_created)
+            }
+
+        return rule_usage_data
+    except Exception as e:
+        print(f"Error fetching rule usage data: {type(e).__name__}: {str(e)}")
+        return {}
+
+def parse_device_summary(output):
+    device_summary = defaultdict(list)
+    current_group = None
+    lines = output.splitlines()
+
+    for line in lines:
+        if line.startswith("Group:"):
+            current_group = line.split()[1]
+        elif current_group and re.match(r'^\d{12}', line):
+            parts = line.split()
+            if len(parts) >= 2:
+                firewall_name = parts[1]
+                device_summary[current_group].append(firewall_name)
+    return device_summary
+
+def fetch_device_summary(panorama_name, ssh):
+    cmd = "show devicegroups"
+    try:
+        response_text = ssh.send_command(cmd, expect_string=r'[>#]')
+        print(f"Fetched device summary for {panorama_name}")
+        return parse_device_summary(response_text)
+    except Exception as e:
+        print(f"Error fetching device summary for {panorama_name}: {type(e).__name__}: {str(e)}")
+    return {}
+
+def write_combined_csv(panorama_name, device_groups, device_summary, panorama, ssh):
+    output_csv = f'{panorama_name}-final.csv'
+
+    with open(output_csv, 'w', newline='') as csvfile, open(AUDIT_FILE, 'a') as auditfile:
+        fieldnames = [
+            'Device-Group', 'Firewalls', 'Rule Type', 'Rule Name', 'Tags',
+            'Source Zone', 'Source Address', 'Source User', 'Source Devices',
+            'Destination Zone', 'Destination Address', 'Destination Devices',
+            'Application', 'Service', 'URL Category', 'Action', 'Profile Group', 'Options',
+            'Target', 'Rule Usage', 'Disabled', 'Description', 'Created'
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for device_group in device_groups:
+            print(f"Processing Device Group: {device_group.name}")
+
+            for rule_type in ['pre-rulebase', 'post-rulebase']:
+                rules = fetch_rules(device_group, rule_type)
+                print(f"Found {len(rules)} {rule_type} rules for {device_group.name}")
+
+                rule_usage_data = get_rule_usage(device_group, rule_type, ssh)
+
+                for rule in rules:
+                    rule_usage_info = rule_usage_data.get(rule.name, {'status': '-', 'created': 'Unknown'})
+                    rule_usage = rule_usage_info['status']
+                    created_date_str = rule_usage_info['created']
+                    created_date = parse_date(created_date_str)
+                    firewalls = ", ".join(device_summary.get(device_group.name, []))
+                    print(f"Rule name: {rule.name}, Rule usage: {rule_usage}, Created: {created_date_str}")
+
+                    # Feature 1: Disable and tag unused rules older than 30 days
+                    if (rule_usage == 'Unused' and
+                        created_date and
+                        datetime.now() - created_date > timedelta(days=30) and
+                        'NO-DELETE' not in (rule.tag or [])):
+                        if 'kill' not in (rule.tag or []):
+                            print(f"Disabling and tagging rule {rule.name}")
+                            rule.disabled = True
+                            if rule.tag is None:
+                                rule.tag = []
+                            rule.tag.append('kill')
+                            try:
+                                rule.apply()
+                                auditfile.write(f"{datetime.now()}: Disabled and tagged rule {rule.name} in device group {device_group.name}\n")
+                            except errors.PanDeviceError as e:
+                                logger.error(f"Failed to apply changes to rule {rule.name}: {str(e)}")
+
+                    # Feature 2: Delete disabled rules with tag "kill"
+                    if rule.disabled and 'kill' in (rule.tag or []):
+                        print(f"Deleting rule {rule.name}")
+                        try:
+                            rule.delete()
+                            auditfile.write(f"{datetime.now()}: Deleted rule {rule.name} from device group {device_group.name}\n")
+                        except errors.PanDeviceError as e:
+                            logger.error(f"Failed to delete rule {rule.name}: {str(e)}")
+
+                    writer.writerow({
+                        'Device-Group': device_group.name,
+                        'Firewalls': firewalls,
+                        'Rule Type': rule_type,
+                        'Rule Name': rule.name,
+                        'Tags': ','.join(rule.tag) if rule.tag else '',
+                        'Source Zone': ','.join(rule.fromzone),
+                        'Source Address': ','.join(rule.source),
+                        'Source User': ','.join(rule.source_user) if isinstance(rule.source_user, (list, tuple)) else '',
+                        'Source Devices': ','.join(rule.source_devices) if hasattr(rule, 'source_devices') and isinstance(rule.source_devices, (list, tuple)) else '',
+                        'Destination Zone': ','.join(rule.tozone),
+                        'Destination Address': ','.join(rule.destination),
+                        'Destination Devices': ','.join(rule.destination_devices) if hasattr(rule, 'destination_devices') and isinstance(rule.destination_devices, (list, tuple)) else '',
+                        'Application': ','.join(rule.application),
+                        'Service': ','.join(rule.service),
+                        'URL Category': ','.join(rule.category) if rule.category else '',
+                        'Action': rule.action,
+                        'Profile Group': rule.group,
+                        'Options': rule.log_setting,
+                        'Target': ','.join(rule.target) if isinstance(rule.target, (list, tuple)) else rule.target,
+                        'Rule Usage': rule_usage,
+                        'Disabled': 'Yes' if rule.disabled else 'No',
+                        'Description': rule.description,
+                        'Created': created_date_str
+                    })
+
+def commit_changes(panorama):
+    """
+    Commits changes made to the panorama configuration
+    """
+    try:
+        # Use USERNAME instead of ADMIN_NAME
+        panorama.commit(sync=True, sync_all=True, admins=USERNAME)
+        logger.info("Configuration committed successfully.")
+    except errors.PanDeviceError as e:
+        logger.error(f"Failed to commit configuration: {str(e)}")
+
+def main():
+    for panorama_name, panorama_ip in PANORAMAS.items():
+        try:
+            logger.info(f"Connecting to Panorama device {panorama_name}...")
+            panorama = Panorama(panorama_ip, USERNAME, PASSWORD)
+            logger.info("Successfully connected to Panorama.")
+        except Exception as e:
+            logger.error(f"Failed to connect to Panorama {panorama_name}: %s", str(e))
+            continue
+
+        # Create tags if they do not exist
+        create_tag_if_not_exists(panorama, 'kill')
+
+        try:
+            logger.info(f"Fetching device groups for {panorama_name}...")
+            device_groups = DeviceGroup.refreshall(panorama)
+            logger.info("Successfully fetched device groups.")
+        except Exception as e:
+            logger.error(f"Failed to fetch device groups for {panorama_name}: {str(e)}")
+            continue
+
+        try:
+            logger.info(f"Connecting via SSH to Panorama device {panorama_name}...")
+            ssh = ConnectHandler(device_type='paloalto_panos', ip=panorama_ip, username=USERNAME, password=PASSWORD, timeout=10)
+            logger.info("Successfully connected via SSH.")
+        except Exception as e:
+            logger.error(f"SSH connection failed for {panorama_name}: {str(e)}")
+            continue
+
+        try:
+            logger.info(f"Fetching device summary for {panorama_name}...")
+            device_summary = fetch_device_summary(panorama_name, ssh)
+        except Exception as e:
+            logger.error(f"Failed to fetch device summary for {panorama_name}: {str(e)}")
+            continue
+
+        try:
+            write_combined_csv(panorama_name, device_groups, device_summary, panorama, ssh)
+        except Exception as e:
+            logger.error(f"Failed to process data for {panorama_name}: {str(e)}")
+        finally:
+            logger.info(f"Disconnecting SSH session for {panorama_name}...")
+            ssh.disconnect()
+
+        # Commit changes after processing each panorama
+        commit_changes(panorama)
+
+if __name__ == "__main__":
+    main()
